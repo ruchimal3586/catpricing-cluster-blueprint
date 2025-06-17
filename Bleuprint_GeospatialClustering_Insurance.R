@@ -2,6 +2,16 @@
 setwd("C:/Users/ruchi/OneDrive/Documents/S&P/Insurance/catpricing_cluster_blueprint")
 rm(list=ls())
 
+# License and Reuse Notice
+# ------------------------------
+# This project is licensed under the MIT License. You may use, modify, and share this code with attribution.
+# See the LICENSE file for full terms.
+
+# Citation and Credit
+# ------------------------------
+# If you use or adapt this blueprint, please cite the GitHub repository:
+# Malhotra, Ruchi. (2024). Cat Pricing Cluster Blueprint. GitHub repository. https://github.com/ruchimal3586/catpricing-cluster-blueprint
+
 
   
   # Cat Model Simulation + Exposure Clustering with Real Hazard Data (CHIRPS)
