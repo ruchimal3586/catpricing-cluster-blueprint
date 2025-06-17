@@ -150,7 +150,8 @@ cluster_summary <- exposure %>%
     avg_cat_load = mean(cat_load, na.rm = TRUE),
     avg_expected_premium = mean(expected_premium),
     total_cat_load = sum(cat_load, na.rm = TRUE),
-    count = n()
+    count = n(),
+    avg_loss_ratio = mean(cat_load / expected_premium, na.rm = TRUE)
   )
 
 print(cluster_summary)
@@ -158,7 +159,7 @@ print(cluster_summary)
 library(knitr)
 library(kableExtra)
 cluster_table <- cluster_summary %>%
-  kable(digits = 2, format = "html", caption = "Residual Summary by Construction Type") %>%
+  kable(digits = 2, format = "html", caption = "Cluster-Level Summary of CAT Load and Premium Metrics") %>%
   kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE)
 
 
@@ -174,6 +175,25 @@ ggplot(cluster_summary, aes(x = cluster)) +
        x = "Cluster",
        y = "Amount ($)") +
   theme_minimal()
+
+# Additional Visualization: Total CAT Load by Cluster
+
+ggplot(cluster_summary, aes(x = cluster, y = total_cat_load, fill = cluster)) +
+  geom_col(show.legend = FALSE) +
+  labs(title = "Total CAT Load by Cluster",
+       x = "Cluster",
+       y = "Total CAT Load ($)") +
+  theme_minimal()
+
+# Additional Visualization: CAT Load to Premium Ratio
+
+ggplot(cluster_summary, aes(x = cluster, y = avg_loss_ratio, fill = cluster)) +
+  geom_col(show.legend = FALSE) +
+  labs(title = "Average Loss Ratio (CAT Load / Premium) by Cluster",
+       x = "Cluster",
+       y = "Loss Ratio") +
+  theme_minimal()
+
 
 # 9. EP Curves by Cluster
 # ------------------------------
