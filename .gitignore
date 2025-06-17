@@ -4,3 +4,13 @@ authentication.js
 node_modules
 notes/
 **/*-todo.md
+*.Rproj
+.Rhistory
+.RData
+.Ruserdata
+*.zip
+*.csv
+*.tif
+output/
+temp/
+cache/
