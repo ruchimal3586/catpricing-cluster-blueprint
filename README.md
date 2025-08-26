@@ -5,7 +5,7 @@
 
 A compact, transparent *mini-cat* workflow that turns hazard rasters → clustered exposures → stochastic event losses → **AAL / EP / PML / TVaR** for pricing and portfolio steering.
 
-**▶ Live demo (HTML):** [Open the report](./catpricing_report.html)
+**▶ Live demo (HTML):** [Open the report](https://ruchimal3586.github.io/catpricing-cluster-blueprint/)
 
 > If the link 404s, knit `Rmd/catpricing_report.Rmd` and move the generated `catpricing_report.html` to the repo root.
 
