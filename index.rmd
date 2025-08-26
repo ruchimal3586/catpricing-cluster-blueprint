@@ -1,0 +1,21 @@
+---
+title: "Cat pricing cluster blueprint"
+author: "Ruchi Malhotra"
+date: "2025-08-26"
+output: html_document
+---
+
+
+This repository demonstrates a compact catastrophe pricing workflow:
+
+- Hazard rasters → exposures → clustering  
+- Stochastic event simulation with policy terms  
+- **AAL, EP, PML(100/200), TVaR(99/99.5)** by cluster  
+- Pricing vs. CAT load comparisons
+
+**▶ Full report:** [Open the detailed HTML](./catpricing_report.html)
+
+
+## Contact
+
+- **Ruchi Malhotra** — ruchi.malhotra1@outlook.com · [LinkedIn](https://www.linkedin.com/in/ruchimalhotra/)

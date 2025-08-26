@@ -1,16 +1,24 @@
+# OS / editor junk
 .DS_store
 .vscode/
-authentication.js
-node_modules
-notes/
-**/*-todo.md
+
+# RStudio / R
 *.Rproj
 .Rhistory
 .RData
 .Ruserdata
-*.zip
-*.csv
-*.tif
+.Rproj.user
+
+# RMarkdown render folders
+*_files/
+
+# Outputs and cache
+outputs/*
 output/
 temp/
 cache/
+
+# Large raw data (decide if you want these on GitHub or not)
+# If too large, ignore; otherwise, commit small sample rasters for reproducibility
+# *.csv
+# *.tif

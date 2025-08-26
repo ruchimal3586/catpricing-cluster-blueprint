@@ -1,0 +1,518 @@
+---
+title: "Cat Pricing Cluster Blueprint — HTML Report"
+author: "Ruchi Malhotra"
+output:
+  html_document:
+    mathjax: null
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 5, fig.align = "center")
+
+set.seed(42)
+
+```  
+
+
+## 1. Libraries
+```{r}
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(purrr); library(scales)
+  library(ggplot2); library(terra); library(sf); library(cluster)
+  library(data.table); library(kableExtra); library(here)
+})
+
+options(kableExtra.auto_format = FALSE)
+
+# helper for PML/TVaR (used later)
+pml_tvar <- function(x, alpha = 0.99){
+  q <- as.numeric(quantile(x, probs = alpha, na.rm = TRUE))
+  tail_vals <- x[x >= q]
+  tvar <- if (length(tail_vals)) mean(tail_vals) else q
+  list(pml = q, tvar = tvar)
+}
+
+
+# helper function for no-wrap column headers
+nowrap <- function(x) sprintf("<span style='white-space:nowrap;'>%s</span>", x)
+
+# format $ with commas
+fmt_dollar0 <- function(x) scales::comma(x, accuracy = 1)
+
+# color negatives (green = savings), positives red
+cell_color_delta <- function(x){
+  ifelse(x < 0,
+         cell_spec(fmt_dollar0(x), color = "white", background = "#2E7D32", bold = TRUE),
+         ifelse(x > 0,
+                cell_spec(fmt_dollar0(x), color = "white", background = "#C62828", bold = TRUE),
+                fmt_dollar0(x)))
+}
+
+```
+
+
+## 2. Inputs and exposure
+```{r, include=FALSE}
+hazard_2014_path <- here::here("data","chirps-v3.0.2014.tif")
+hazard_2024_path <- here::here("data","chirps-v3.0.2024.tif")
+out_dir <- here::here("outputs"); if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+stopifnot(file.exists(hazard_2014_path), file.exists(hazard_2024_path))
+
+n_assets <- 500
+exposure <- tibble(
+  asset_id = 1:n_assets,
+  lat = runif(n_assets, 32.5, 42),
+  lon = runif(n_assets, -124.5, -114),
+  insured_value = runif(n_assets, 200000, 1000000),
+  construction = sample(c("wood","masonry","steel"), n_assets, replace = TRUE),
+  occupancy    = sample(c("residential","commercial"), n_assets, replace = TRUE),
+  deductible   = 5000,
+  limit        = 750000
+)
+
+asset_pts <- terra::vect(exposure, geom = c("lon","lat"), crs = "EPSG:4326")
+hazard_2014 <- rast(hazard_2014_path)
+hazard_2024 <- rast(hazard_2024_path)
+
+exposure$precip_2014 <- terra::extract(hazard_2014, asset_pts)[[2]]
+exposure$precip_2024 <- terra::extract(hazard_2024, asset_pts)[[2]]
+exposure <- exposure %>%
+  mutate(precip_change   = precip_2024 - precip_2014,
+         fire_risk_score = log1p(pmax(0, precip_change)))
+
+
+```
+
+## 3. Clustering (k-means)
+
+```{r}
+
+df_cluster <- exposure %>%
+  mutate(construction_num = as.numeric(factor(construction)),
+         occupancy_num    = as.numeric(factor(occupancy))) %>%
+  select(insured_value, precip_2024, fire_risk_score, construction_num, occupancy_num) %>%
+  drop_na()
+
+k <- 5
+km_model <- kmeans(df_cluster, centers = k, nstart = 20)
+exposure$cluster <- factor(km_model$cluster)
+
+```
+
+
+## 4. Stochastic events, policy terms, AAL
+
+```{r}
+vuln_lookup <- c(wood = 0.6, masonry = 0.4, steel = 0.2)
+exposure$vuln_factor <- as.numeric(vuln_lookup[exposure$construction])
+
+n_events <- 1000
+event_catalog <- tibble(event_id = 1:n_events,
+                        severity = rexp(n_events, rate = 1/1.5))
+
+sim_matrix <- tidyr::expand_grid(asset_id = exposure$asset_id, event_id = event_catalog$event_id) %>%
+  left_join(exposure, by = "asset_id") %>%
+  left_join(event_catalog, by = "event_id") %>%
+  mutate(
+    raw_loss   = insured_value * vuln_factor * severity * fire_risk_score * 0.01,
+    gross_loss = pmax(0, raw_loss - deductible),
+    net_loss   = pmin(gross_loss, limit)
+  )
+
+aal_df <- sim_matrix %>%
+  group_by(asset_id) %>%
+  summarise(cat_load = mean(net_loss, na.rm = TRUE), .groups = "drop")
+exposure <- exposure %>% left_join(aal_df, by = "asset_id")
+
+base_rate <- 0.02
+construction_factors <- c(wood = 1.2, masonry = 1.0, steel = 0.9)
+exposure <- exposure %>%
+  mutate(expected_premium = insured_value * base_rate * construction_factors[construction])
+
+```
+
+
+## 5. Cluster plots and summary
+```{r}
+
+cluster_summary <- exposure %>%
+  group_by(cluster) %>%
+  summarise(
+    count                = n(),
+    avg_insured_value    = mean(insured_value),
+    avg_fire_risk        = mean(fire_risk_score),
+    avg_cat_load         = mean(cat_load, na.rm = TRUE),
+    total_cat_load       = sum(cat_load, na.rm = TRUE),
+    avg_expected_premium = mean(expected_premium),
+    avg_loss_ratio       = mean(cat_load / expected_premium, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cluster_summary %>%
+  mutate(across(where(is.numeric), ~round(., 2))) %>%
+  kable(caption = "Cluster-Level Summary of CAT Load and Premium Metrics") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"), full_width = FALSE)
+
+
+```
+
+```{r}
+# Make long data for plotting
+cluster_summary_long <- cluster_summary %>%
+  dplyr::select(cluster, avg_cat_load, avg_expected_premium) %>%
+  tidyr::pivot_longer(
+    cols = c(avg_cat_load, avg_expected_premium),
+    names_to = "Metric", values_to = "Amount"
+  ) %>%
+  dplyr::mutate(
+    Metric = dplyr::recode(Metric,
+      avg_cat_load = "CAT Load",
+      avg_expected_premium = "Expected Premium"
+    )
+  )
+
+```
+
+# Plot 1: Average CAT Load vs Expected Premium 
+```{r}
+ggplot(cluster_summary_long, aes(x = cluster, y = Amount, fill = Metric)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Average CAT Load vs Expected Premium by Cluster",
+       x = "Cluster", y = "Amount ($)", fill = "Metric") +
+  theme_minimal()
+
+```
+
+# Plot 2: Total CAT Load by Cluster 
+```{r}
+ggplot(cluster_summary, aes(cluster, total_cat_load, fill = cluster)) +
+  geom_col(show.legend = FALSE) +
+  labs(title = "Total CAT Load by Cluster", x = "Cluster", y = "Total CAT Load ($)") +
+  theme_minimal()
+
+```
+
+
+
+# Plot 3: Average Loss Ratio (CAT Load / Premium) by Cluster 
+```{r}
+ggplot(cluster_summary, aes(cluster, avg_loss_ratio, fill = cluster)) +
+  geom_col(show.legend = FALSE) +
+  labs(title = "Average Loss Ratio (CAT Load / Premium) by Cluster", x = "Cluster", y = "Loss Ratio") +
+  theme_minimal()
+
+```
+
+
+## 6. EP curves, PML(100)/PML(200), TVaR(99/99.5)
+
+```{r}
+
+dt <- as.data.table(sim_matrix)
+event_cluster_losses <- dt[, .(event_loss = sum(net_loss, na.rm=TRUE)),
+                           by = .(cluster, event_id)]
+
+metrics <- event_cluster_losses[, {
+  m99  <- pml_tvar(event_loss, 0.99)
+  m995 <- pml_tvar(event_loss, 0.995)
+  .(PML_100 = m99$pml, TVaR_99 = m99$tvar,
+    PML_200 = m995$pml, TVaR_99_5 = m995$tvar)
+}, by = cluster]
+
+
+```
+
+```{r}
+dt <- as.data.table(sim_matrix)
+event_cluster_losses <- dt[, .(event_loss = sum(net_loss, na.rm=TRUE)),
+                           by = .(cluster, event_id)]
+
+metrics <- event_cluster_losses[, {
+  m99  <- pml_tvar(event_loss, 0.99)
+  m995 <- pml_tvar(event_loss, 0.995)
+  .(PML_100 = m99$pml, TVaR_99 = m99$tvar,
+    PML_200 = m995$pml, TVaR_99_5 = m995$tvar)
+}, by = cluster]
+
+```
+
+```{r}
+
+metrics %>%
+  mutate(across(where(is.numeric), ~round(., 0))) %>%
+  kable(caption = "PML & TVaR by Cluster") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"), full_width = FALSE)
+```
+
+```{r}
+probs <- seq(0.001, 0.99, by = 0.001)
+ep <- event_cluster_losses[, .(
+  loss = quantile(event_loss, probs = 1 - probs, na.rm = TRUE),
+  ep   = probs
+), by = cluster]
+
+ggplot(ep, aes(ep, loss, color = cluster)) +
+  geom_line(linewidth = 1.05) +
+  scale_x_reverse(labels = scales::percent) +
+  labs(title = "EP Curves by Cluster", x = "Exceedance Probability", y = "Loss ($)") +
+  theme_minimal()
+
+```
+
+## 7. EP curves after hardening
+
+```{r harden_prep, include = FALSE}
+
+# Option A: global % reduction of vulnerability for all assets
+hardening_reduction <- 0.20               # 20% reduction
+exposure_hardened <- exposure %>%
+  mutate(vuln_factor = vuln_factor * (1 - hardening_reduction))
+
+
+
+# ---- Reuse SAME event catalog for comparability ----
+# n_events and event_catalog already defined in baseline; we reuse event_catalog
+
+# ---- Re-run stochastic losses with policy terms (hardened) ----
+sim_matrix_hardened <- tidyr::expand_grid(asset_id = exposure_hardened$asset_id,
+                                          event_id = event_catalog$event_id) %>%
+  left_join(exposure_hardened, by = "asset_id") %>%
+  left_join(event_catalog,    by = "event_id") %>%
+  mutate(
+    raw_loss_h   = insured_value * vuln_factor * severity * fire_risk_score * 0.01,
+    gross_loss_h = pmax(0, raw_loss_h - deductible),
+    net_loss_h   = pmin(gross_loss_h, limit)
+  )
+
+# ---- Aggregate event losses at cluster event totals (hardened) ----
+event_cluster_losses_h <- as.data.table(sim_matrix_hardened)[,
+  .(event_loss = sum(net_loss_h, na.rm = TRUE)),
+  by = .(cluster, event_id)
+]
+
+# Aggregate to PORTFOLIO-EVENT totals (baseline and hardened)
+event_portfolio_losses    <- as.data.table(sim_matrix)[, .(event_loss = sum(net_loss,   na.rm=TRUE)), by = event_id]
+event_portfolio_losses_h  <- as.data.table(sim_matrix_hardened)[, .(event_loss = sum(net_loss_h, na.rm=TRUE)), by = event_id]
+
+```
+
+## Portfolio-level EP curve overlay
+
+```{r ep_overlay_portfolio, echo=FALSE, message=FALSE, warning=FALSE}
+probs <- seq(0.001, 0.99, by = 0.001)
+
+# Build portfolio EP curves for both scenarios
+ep_portfolio <- tibble(
+  scenario = "Baseline",
+  ep = probs,
+  loss = quantile(event_portfolio_losses$event_loss, probs = 1 - probs, na.rm = TRUE)
+) %>%
+  bind_rows(tibble(
+    scenario = "Hardened",
+    ep = probs,
+    loss = quantile(event_portfolio_losses_h$event_loss, probs = 1 - probs, na.rm = TRUE)
+  ))
+
+# Plot overlay
+ggplot(ep_portfolio, aes(ep, loss, linetype = scenario)) +
+  geom_line(linewidth = 1.05) +
+  scale_x_reverse(labels = scales::percent) +
+  labs(title = "Impact of Hardening on Tail Losses — Portfolio EP Curves",
+       x = "Exceedance Probability", y = "Loss ($)", linetype = "Scenario") +
+  theme_minimal()
+
+```
+
+## Portfolio metrics before vs after
+```{r portfolio_metrics_compare, echo=FALSE, message=FALSE, warning=FALSE}
+# AAL = mean of event losses
+aal_base <- mean(event_portfolio_losses$event_loss, na.rm = TRUE)
+aal_hard <- mean(event_portfolio_losses_h$event_loss, na.rm = TRUE)
+
+# PML/TVaR helper already defined: pml_tvar()
+m99_base  <- pml_tvar(event_portfolio_losses$event_loss, 0.99)
+m995_base <- pml_tvar(event_portfolio_losses$event_loss, 0.995)
+m99_h     <- pml_tvar(event_portfolio_losses_h$event_loss, 0.99)
+m995_h    <- pml_tvar(event_portfolio_losses_h$event_loss, 0.995)
+
+portfolio_compare <- tibble(
+  Metric = c("AAL", "PML(100)", "TVaR(99)", "PML(200)", "TVaR(99.5)"),
+  Baseline = c(aal_base, m99_base$pml, m99_base$tvar, m995_base$pml, m995_base$tvar),
+  Hardened = c(aal_hard, m99_h$pml,   m99_h$tvar,   m995_h$pml,   m995_h$tvar)
+) %>%
+  mutate(
+    `Δ ($)`   = Hardened - Baseline,
+    `Δ (%)`   = 100 * (Hardened / Baseline - 1)
+  )
+
+portfolio_compare %>%
+  mutate(across(c(Baseline, Hardened, `Δ ($)`), ~round(.,0)),
+         `Δ (%)` = scales::percent(`Δ (%)`/100, accuracy = 0.1)) %>%
+  kable(caption = "Portfolio Metrics — Before vs After Hardening") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"), full_width = FALSE)
+```
+
+## Cluster-level AAL and tail benefits
+
+```{r cluster_benefits_tbl, echo=FALSE, message=FALSE, warning=FALSE}
+# Baseline cluster AAL
+aal_cluster_base <- as.data.table(sim_matrix)[, .(AAL = mean(net_loss, na.rm=TRUE)), by = cluster]
+# Hardened cluster AAL
+aal_cluster_h    <- as.data.table(sim_matrix_hardened)[, .(AAL = mean(net_loss_h, na.rm=TRUE)), by = cluster]
+
+# Tail metrics per cluster
+metrics_base <- event_cluster_losses[, {
+  m99 <- pml_tvar(event_loss, 0.99); m995 <- pml_tvar(event_loss, 0.995)
+  .(PML_100 = m99$pml, TVaR_99 = m99$tvar, PML_200 = m995$pml, TVaR_99_5 = m995$tvar)
+}, by = cluster]
+
+metrics_h <- event_cluster_losses_h[, {
+  m99 <- pml_tvar(event_loss, 0.99); m995 <- pml_tvar(event_loss, 0.995)
+  .(PML_100 = m99$pml, TVaR_99 = m99$tvar, PML_200 = m995$pml, TVaR_99_5 = m995$tvar)
+}, by = cluster]
+
+cluster_compare <- aal_cluster_base %>%
+  rename(AAL_base = AAL) %>%
+  full_join(aal_cluster_h %>% rename(AAL_h = AAL), by = "cluster") %>%
+  left_join(metrics_base %>% rename_with(~paste0(.x,"_base"), -cluster), by = "cluster") %>%
+  left_join(metrics_h %>%    rename_with(~paste0(.x,"_h"),    -cluster), by = "cluster") %>%
+  mutate(
+    AAL_delta   = AAL_h - AAL_base,
+    PML100_dlt  = PML_100_h - PML_100_base,
+    TVaR99_dlt  = TVaR_99_h - TVaR_99_base
+  ) %>%
+  arrange(AAL_delta)
+
+```
+
+
+```{r}
+cluster_benefits_tbl <- cluster_compare %>%
+  transmute(
+    Cluster          = as.character(cluster),
+    AAL_Base         = AAL_base,
+    AAL_Hardened     = AAL_h,
+    dAAL             = AAL_h - AAL_base,
+    dPML100          = PML100_dlt,
+    dTVaR99          = TVaR99_dlt
+  ) %>%
+  arrange(dAAL) %>%
+  mutate(
+    across(c(AAL_Base, AAL_Hardened, dAAL, dPML100, dTVaR99), fmt_dollar0)
+  )
+```
+
+
+```{r}
+benefits_print_fmt <- cluster_benefits_tbl %>%
+  kable(
+    format    = "html",
+    col.names = c("Cluster","AAL (Base)","AAL (Hardened)","Δ AAL ($)","Δ PML(100) ($)","Δ TVaR(99) ($)"),
+    caption   = "Cluster-Level Benefits — AAL and Tail Metrics (Hardened minus Baseline)",
+    align     = c("c","r","r","r","r","r")
+  ) %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE, position = "left", font_size = 12) %>%
+  row_spec(0, extra_css = "white-space:nowrap;") %>%
+  column_spec(1, width = "6em", bold = TRUE) %>%
+  column_spec(2:6, width = "11em") %>%
+  scroll_box(height = "320px", width = "auto")
+
+```
+
+## AAL savings by cluster bar chart
+
+```{r aal_savings_plot, echo=FALSE, message=FALSE, warning=FALSE}
+cluster_compare %>%
+  mutate(`AAL Savings ($)` = -AAL_delta) %>%      # negative delta -> savings
+  ggplot(aes(x = reorder(cluster, `AAL Savings ($)`), y = `AAL Savings ($)`)) +
+  geom_col() +
+  coord_flip() +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "AAL Savings by Cluster — Effect of Hardening",
+       x = "Cluster", y = "Savings ($)") +
+  theme_minimal()
+```
+
+
+```{r pricing_adequacy_tbl, results = 'asis', echo=FALSE, message=FALSE, warning=FALSE}
+
+pricing_print <- cluster_summary %>%
+  transmute(
+    Cluster              = as.character(cluster),
+    Avg_CAT_Load         = avg_cat_load,
+    Avg_Premium          = avg_expected_premium,
+    CAT_Load_to_Premium  = avg_cat_load / avg_expected_premium
+  ) %>%
+  arrange(desc(CAT_Load_to_Premium)) %>%
+  mutate(
+    across(c(Avg_CAT_Load, Avg_Premium), ~ fmt_dollar0(.x)),
+    CAT_Load_to_Premium = round(CAT_Load_to_Premium, 3)
+  )
+
+```
+
+
+```{r results='asis', echo=FALSE, message=FALSE, warning=FALSE}
+
+
+pricing_print %>%
+  kable(
+    format = "html",
+    col.names = c("Cluster","Avg CAT Load ($)","Avg Premium ($)","CAT Load / Premium"),
+    caption = "Pricing Adequacy by Cluster (CAT Load vs Premium)",
+     align     = c("c","r","r","r")
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped","hover","condensed"),
+    full_width = FALSE,
+    position   = "left",
+    font_size  = 12
+  ) %>%
+   row_spec(0, extra_css = "white-space:nowrap;") %>%   # no wrap in header
+  column_spec(1, width = "6em", bold = TRUE) %>%
+  column_spec(2:4, width = "10em") %>%
+  scroll_box(height = "300px", width = "auto")
+
+```
+
+
+# Interpretation of Results
+
+The results provide a structured view of how clustered exposures perform under simulated catastrophe shocks:
+
+
+1) **Avg CAT Load vs Expected Premium (Plot 1)**  
+   - In every cluster, **Expected Premium > Avg CAT Load**.  
+   - That means the modeled catastrophe portion of loss is **covered by the current premium** on an average-year basis.
+
+2) **Total CAT Load by Cluster (Plot 2)**  
+   - Cluster **4** contributes the **largest absolute CAT dollars** (portfolio accumulation).  
+   - Even with adequate average pricing, high dollar accumulation makes Cluster 4 the **dominant driver of portfolio volatility and tail risk**.
+
+3) **Average Loss Ratio (Plot 3)**  
+   - CAT loss ratios (CAT Load / Premium) are **< 1.0** across the board.  
+   - Cluster 4, then 2 and 1, sit at the higher end of ratios; Cluster 3 is the lowest.  
+   - Interpretation: pricing **isn’t under** for CAT, but some clusters **consume more of the premium** to cover CAT risk, leaving less room for non-CAT perils, expenses, and margin.
+
+4) **PML & TVaR Table**  
+   - Cluster **4** shows the **largest PML(100) and TVaR(99)** values → highest **extreme-event exposure**.  
+   - TVaR being meaningfully above PML confirms a **fat tail**; this is where reinsurance and capital decisions bite.
+
+5) **EP Curves**  
+   - Cluster 4’s curve sits **highest/right-most** in the tail → at the same exceedance probability, it expects **bigger losses** than other clusters.  
+   - Clusters 1 and 2 follow; Cluster 3 is most resilient.
+
+---
+
+## Actionable Takeaways
+
+- **Risk transfer & capital:** Size reinsurance layers primarily off **Cluster 4** (tail-heavy), then 2 and 1. Use PML/TVaR to set attachment and limits.  
+- **Portfolio steering:** If you want to reduce tail, **de-risk Cluster 4** (blend of underwriting appetite, limits, and accumulation caps).  
+- **Resilience capex:** Prioritize hardening for assets in Cluster 4 (and next 2/1). Even if pricing covers average CAT, **tail losses** dominate capital and rating-agency views.  
+- **Pricing adequacy (CAT slice only):** Current premium covers modeled CAT across clusters. Any overall pricing action should consider **non-CAT perils + expenses + target margin** on top of the CAT slice.
+
+*Bottom line:* CAT pricing looks **adequate on average**, but **tail concentration** (PML/TVaR, EP curves) makes **Cluster 4** the lever for reinsurance, capital efficiency, and resilience ROI.

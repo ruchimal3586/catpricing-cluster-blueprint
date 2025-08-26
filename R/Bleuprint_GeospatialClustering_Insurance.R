@@ -1,6 +1,4 @@
 
-setwd("C:/Users/ruchi/OneDrive/Documents/S&P/Insurance/catpricing_cluster_blueprint")
-rm(list=ls())
 
 # License and Reuse Notice
 # ------------------------------
@@ -13,24 +11,29 @@ rm(list=ls())
 # Malhotra, Ruchi. (2024). Cat Pricing Cluster Blueprint. GitHub repository. https://github.com/ruchimal3586/catpricing-cluster-blueprint
 
 
-  
-  # Cat Model Simulation + Exposure Clustering with Real Hazard Data (CHIRPS)
-  
-library(dplyr)
-library(terra)
-library(sf)
-library(ggplot2)
-library(cluster)
-library(tidyr)
-library(purrr)
-library(scales)
-library(data.table)
+# Compact mini-cat pipeline: clustering + stochastic losses + EP/PML/TVaR
+# Reads rasters from data/, writes CSVs to outputs/. No setwd().
+
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(purrr); library(scales)
+  library(ggplot2); library(terra); library(sf); library(cluster)
+  library(data.table); library(kableExtra); library(here)
+})
 
 set.seed(42)
 
-# ------------------------------
-# 1. Generate Random Exposure Points in California
-# ------------------------------
+# Paths (relative to repo root)
+hazard_2014_path <- here::here("data", "chirps-v3.0.2014.tif")
+hazard_2024_path <- here::here("data", "chirps-v3.0.2024.tif")
+out_dir          <- here::here("outputs")
+fig_dir          <- file.path(out_dir, "figures")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+
+stopifnot(file.exists(hazard_2014_path), file.exists(hazard_2024_path))
+
+
+## 2. Generate Random Exposure Points in California
 
 n_assets <- 500
 exposure <- tibble(
@@ -45,17 +48,24 @@ exposure <- tibble(
 )
 
 # Convert to spatial object
-asset_pts <- terra::vect(exposure, geom = c('lon', 'lat'), crs = 4326)
+asset_pts <- terra::vect(exposure, geom = c("lon","lat"), crs = "EPSG:4326")
+print(crs(asset_pts))
 
 # ------------------------------
 # 2. Load CHIRPS Hazard Rasters
 # ------------------------------
-hazard_2014 <- rast("chirps-v3.0.2014.tif")
-hazard_2024 <- rast("chirps-v3.0.2024.tif")
+hazard_2014_path <- here::here("data", "chirps-v3.0.2014.tif")
+hazard_2024_path <- here::here("data", "chirps-v3.0.2024.tif")
 
-# Exposure raste value assignments
+stopifnot(file.exists(hazard_2014_path), file.exists(hazard_2024_path))
+
+hazard_2014 <- terra::rast(hazard_2014_path)
+hazard_2024 <- terra::rast(hazard_2024_path)
+
+# Exposure raster value assignments
 exposure$precip_2014 <- terra::extract(hazard_2014, asset_pts)[[2]]
 exposure$precip_2024 <- terra::extract(hazard_2024, asset_pts)[[2]]
+
 
 # ------------------------------
 # 3. Compute Precip Change & Fire Risk Proxy
@@ -102,7 +112,7 @@ k <- 5
 km_model <- kmeans(df_cluster, centers = k)
 exposure$cluster <- as.factor(km_model$cluster)
 
-#6. Simulate CAT Load with Stochastic Event Losses and Financial Logic
+#6. Simulate CAT Load with Stochastic Event Losses and Policy terms
 # ------------------------------
 vuln_lookup <- c(wood = 0.6, masonry = 0.4, steel = 0.2)
 exposure$vuln_factor <- vuln_lookup[exposure$construction]
@@ -136,18 +146,31 @@ sim_matrix <- sim_matrix %>%
   )
 
 
-# Compute average loss per asset (AAL)
+# Compute average loss per asset (AAL) per asset
 aal_df <- sim_matrix %>%
   group_by(asset_id) %>%
   summarise(cat_load = mean(net_loss, na.rm = TRUE))
 
 exposure <- exposure %>% left_join(aal_df, by = "asset_id")
 
-# Simulate expected premium via GLM
+# Simulate expected premium via GLM using a simple proxy
 base_rate <- 0.02
 construction_factors <- c(wood = 1.2, masonry = 1.0, steel = 0.9)
 exposure <- exposure %>%
   mutate(expected_premium = insured_value * base_rate * construction_factors[construction])
+
+
+# 6b. GLM Fit with Regularization (LASSO)
+x_vars <- model.matrix(cat_load ~ insured_value + fire_risk_score + factor(construction) + factor(occupancy), data = exposure)[, -1]
+y_var <- exposure$cat_load
+
+lasso_model <- cv.glmnet(x_vars, y_var, alpha = 1)  # Gaussian is default
+print(lasso_model)
+
+predicted <- predict(lasso_model, newx = x_vars, s = "lambda.min")
+residuals <- y_var - predicted
+
+hist(residuals, breaks = 40, main = "LASSO GLM Residuals", xlab = "Residuals")
 
 # ------------------------------
 # 7. Cluster-Level Summary
@@ -161,23 +184,52 @@ cluster_summary <- exposure %>%
     avg_expected_premium = mean(expected_premium),
     total_cat_load = sum(cat_load, na.rm = TRUE),
     count = n(),
-    avg_loss_ratio = mean(cat_load / expected_premium, na.rm = TRUE)
+    avg_loss_ratio = mean(cat_load / expected_premium, na.rm = TRUE),
+    .groups ="drop"
   )
 
-print(cluster_summary)
 
-library(knitr)
-library(kableExtra)
-cluster_table <- cluster_summary %>%
-  kable(digits = 2, format = "html", caption = "Cluster-Level Summary of CAT Load and Premium Metrics") %>%
-  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE)
+# ------------------------------
+# 8. EP curves + PML/TVaR (cluster level)
+# ------------------------------
+dt <- as.data.table(sim_matrix)
+#Total loss an event causes to a cluster
+event_cluster_losses <- dt[, .(event_loss = sum(net_loss, na.rm=TRUE)),
+                           by = .(cluster, event_id)]
+
+# helper, given vector x: all event losses for a cluster, PML captures quantile at alpha=0.99 or return period 100 years
+#and tvar captures tail severity or average of all losses higher than quantile
+pml_tvar <- function(x, alpha = 0.99){
+  q <- as.numeric(quantile(x, probs = alpha, na.rm = TRUE))  # e.g., 0.99 => PML(100)
+  tail_vals <- x[x >= q]
+  tvar <- if (length(tail_vals)) mean(tail_vals) else q
+  list(pml = q, tvar = tvar)
+}
+
+#For each cluster, compute: PML_100 = 99th percentile, TVaR_99 = mean of the worst 1% losses,
+#PML_200 = 99.5th percentile,TVaR_99_5= mean of the worst 0.5% losses.
+
+metrics <- event_cluster_losses[, {
+  m99  <- pml_tvar(event_loss, 0.99)    # ~1-in-100
+  m995 <- pml_tvar(event_loss, 0.995)   # ~1-in-200
+  .(PML_100 = m99$pml, TVaR_99 = m99$tvar,
+    PML_200 = m995$pml, TVaR_99_5 = m995$tvar)
+}, by = cluster]
 
 
 
 # ------------------------------
-# 8. Visualize CAT Load vs Expected Premium by Cluster
+# 9. Save CSVs
 # ------------------------------
-ggplot(cluster_summary, aes(x = cluster)) +
+write.csv(exposure,        file.path(out_dir, "exposure_with_clusters_and_catload.csv"), row.names = FALSE)
+write.csv(cluster_summary, file.path(out_dir, "cluster_level_summary.csv"),              row.names = FALSE)
+write.csv(metrics,         file.path(out_dir, "cluster_pml_tvar_summary.csv"),          row.names = FALSE)
+
+
+# ------------------------------
+# 10. Visualize CAT Load vs Expected Premium by Cluster
+# ------------------------------
+p1 <- ggplot(cluster_summary, aes(x = cluster)) +
   geom_col(aes(y = avg_cat_load, fill = "CAT Load"), position = "dodge") +
   geom_col(aes(y = avg_expected_premium, fill = "Expected Premium"), position = "dodge") +
   scale_fill_manual(name = "Metric", values = c("CAT Load" = "firebrick", "Expected Premium" = "steelblue")) +
@@ -186,47 +238,36 @@ ggplot(cluster_summary, aes(x = cluster)) +
        y = "Amount ($)") +
   theme_minimal()
 
-# Additional Visualization: Total CAT Load by Cluster
+ggsave(file.path(fig_dir, "catload_vs_premium.png"), p1, width = 8, height = 5, dpi = 150)
 
-ggplot(cluster_summary, aes(x = cluster, y = total_cat_load, fill = cluster)) +
-  geom_col(show.legend = FALSE) +
-  labs(title = "Total CAT Load by Cluster",
-       x = "Cluster",
-       y = "Total CAT Load ($)") +
+
+
+
+# 11. Build EP data for one cluster and annotate PMLs
+# ------------------------------
+
+
+# Build EP data for one cluster and annotate PMLs
+one_cluster <- levels(exposure$cluster)[1]
+probs <- seq(0.001, 0.99, by = 0.001)
+ep <- event_cluster_losses[, .(
+  loss = quantile(event_loss, probs = 1 - probs, na.rm = TRUE),
+  ep   = probs
+), by = cluster]
+
+mrow <- metrics %>% filter(cluster == one_cluster)
+p2 <- ep %>% filter(cluster == one_cluster) %>%
+  ggplot(aes(ep, loss)) +
+  geom_line() +
+  geom_hline(yintercept = mrow$PML_100, linetype = "dashed") +
+  geom_hline(yintercept = mrow$PML_200, linetype = "dotted") +
+  scale_x_reverse(labels = scales::percent) +
+  labs(title = paste("EP with PML Markers — Cluster", one_cluster),
+       x = "Exceedance Probability", y = "Loss ($)") +
   theme_minimal()
 
-# Additional Visualization: CAT Load to Premium Ratio
+ggsave(file.path(fig_dir, "ep_with_pml_one_cluster.png"), p2, width = 8, height = 5, dpi = 150)
 
-ggplot(cluster_summary, aes(x = cluster, y = avg_loss_ratio, fill = cluster)) +
-  geom_col(show.legend = FALSE) +
-  labs(title = "Average Loss Ratio (CAT Load / Premium) by Cluster",
-       x = "Cluster",
-       y = "Loss Ratio") +
-  theme_minimal()
-
-
-# 9. EP Curves by Cluster
-# ------------------------------
-sim_matrix_dt <- as.data.table(sim_matrix)
-
-ep_curves <- sim_matrix_dt[, .(quantile = seq(0, 0.99, 0.01)), by = .(cluster)]
-ep_curves <- merge(
-  ep_curves,
-  sim_matrix_dt[, .(net_loss = quantile(net_loss, probs = seq(0, 0.99, 0.01), na.rm = TRUE)), by = .(cluster)],
-  by = c("cluster", "quantile")
-)
-
-ggplot(ep_curves, aes(x = quantile, y = net_loss, color = cluster)) +
-  geom_line(size = 1.2) +
-  labs(title = "EP Curve by Cluster", x = "Exceedance Probability (1 - p)", y = "Loss ($)") +
-  theme_minimal()
-
-
-
-# ------------------------------
-# 9. Export CSV
-# ------------------------------
-write.csv(exposure, "exposure_with_clusters_and_catload.csv", row.names = FALSE)
-write.csv(cluster_summary, "cluster_level_summary.csv", row.names = FALSE)
+message("Done. CSVs in outputs/, figures in outputs/figures/")
 
 
