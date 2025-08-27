@@ -210,22 +210,6 @@ ggplot(cluster_summary, aes(cluster, avg_loss_ratio, fill = cluster)) +
 ## 6. EP curves, PML(100)/PML(200), TVaR(99/99.5)
 
 ```{r}
-
-dt <- as.data.table(sim_matrix)
-event_cluster_losses <- dt[, .(event_loss = sum(net_loss, na.rm=TRUE)),
-                           by = .(cluster, event_id)]
-
-metrics <- event_cluster_losses[, {
-  m99  <- pml_tvar(event_loss, 0.99)
-  m995 <- pml_tvar(event_loss, 0.995)
-  .(PML_100 = m99$pml, TVaR_99 = m99$tvar,
-    PML_200 = m995$pml, TVaR_99_5 = m995$tvar)
-}, by = cluster]
-
-
-```
-
-```{r}
 dt <- as.data.table(sim_matrix)
 event_cluster_losses <- dt[, .(event_loss = sum(net_loss, na.rm=TRUE)),
                            by = .(cluster, event_id)]
@@ -357,7 +341,7 @@ portfolio_compare %>%
 
 ## Cluster-level AAL and tail benefits
 
-```{r cluster_benefits_tbl, echo=FALSE, message=FALSE, warning=FALSE}
+```{r cluster_benefits_tbl, results='asis', echo=FALSE, message=FALSE, warning=FALSE}
 # Baseline cluster AAL
 aal_cluster_base <- as.data.table(sim_matrix)[, .(AAL = mean(net_loss, na.rm=TRUE)), by = cluster]
 # Hardened cluster AAL
@@ -386,10 +370,6 @@ cluster_compare <- aal_cluster_base %>%
   ) %>%
   arrange(AAL_delta)
 
-```
-
-
-```{r}
 cluster_benefits_tbl <- cluster_compare %>%
   transmute(
     Cluster          = as.character(cluster),
@@ -403,25 +383,25 @@ cluster_benefits_tbl <- cluster_compare %>%
   mutate(
     across(c(AAL_Base, AAL_Hardened, dAAL, dPML100, dTVaR99), fmt_dollar0)
   )
-```
 
-
-```{r}
-benefits_print_fmt <- cluster_benefits_tbl %>%
+cluster_benefits_tbl %>%
   kable(
-    format    = "html",
-    col.names = c("Cluster","AAL (Base)","AAL (Hardened)","Δ AAL ($)","Δ PML(100) ($)","Δ TVaR(99) ($)"),
-    caption   = "Cluster-Level Benefits — AAL and Tail Metrics (Hardened minus Baseline)",
-    align     = c("c","r","r","r","r","r")
+    format  = "html",
+    caption = "Cluster-Level Benefits — AAL and Tail Metrics (Hardened minus Baseline)",
+    align   = c("c","r","r","r","r","r"),
+    escape  = FALSE
   ) %>%
-  kable_styling(bootstrap_options = c("striped","hover","condensed"),
-                full_width = FALSE, position = "left", font_size = 12) %>%
-  row_spec(0, extra_css = "white-space:nowrap;") %>%
-  column_spec(1, width = "6em", bold = TRUE) %>%
-  column_spec(2:6, width = "11em") %>%
-  scroll_box(height = "320px", width = "auto")
+  kable_styling(
+    bootstrap_options = c("striped","hover","condensed"),
+    full_width = FALSE,
+    position   = "left",
+    font_size  = 12
+  ) %>%
+  column_spec(1, width = "6em",  bold = TRUE) %>%
+  column_spec(2:6, width = "11em")
 
 ```
+
 
 ## AAL savings by cluster bar chart
 
@@ -458,13 +438,12 @@ pricing_print <- cluster_summary %>%
 
 ```{r results='asis', echo=FALSE, message=FALSE, warning=FALSE}
 
-
 pricing_print %>%
   kable(
-    format = "html",
-    col.names = c("Cluster","Avg CAT Load ($)","Avg Premium ($)","CAT Load / Premium"),
+    format  = "html",
     caption = "Pricing Adequacy by Cluster (CAT Load vs Premium)",
-     align     = c("c","r","r","r")
+    align   = c("c","r","r","r"),
+    escape  = FALSE
   ) %>%
   kable_styling(
     bootstrap_options = c("striped","hover","condensed"),
@@ -472,13 +451,11 @@ pricing_print %>%
     position   = "left",
     font_size  = 12
   ) %>%
-   row_spec(0, extra_css = "white-space:nowrap;") %>%   # no wrap in header
-  column_spec(1, width = "6em", bold = TRUE) %>%
-  column_spec(2:4, width = "10em") %>%
-  scroll_box(height = "300px", width = "auto")
+  column_spec(1, width = "6em",  bold = TRUE) %>%
+  column_spec(2:4, width = "10em")
+
 
 ```
-
 
 # Interpretation of Results
 
